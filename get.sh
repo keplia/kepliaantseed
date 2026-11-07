@@ -1,5 +1,5 @@
 # Satu perintah: unduh script, lalu jalankan.
-#   curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/get.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/keplia/kepliaantseed/main/get.sh | sudo bash
 #
 # Opsi:
 #   curl -fsSL .../get.sh | sudo bash -s -- --token 'cf_...' --domain example.com --count 2
@@ -15,17 +15,18 @@ command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 
 dir=/opt/antseed-fleet
 mkdir -p "$dir"
-for f in install.sh antseed-fleet; do
+for f in install.sh antseed-fleet README.md; do
   curl -fsSL "$BASE/$f" -o "$dir/$f"
 done
-curl -fsSL "$BASE/README.md" -o "$dir/README.md" || true
 chmod +x "$dir/install.sh" "$dir/antseed-fleet"
 ln -sf "$dir/antseed-fleet" /usr/local/bin/antseed-fleet
+echo "-> scripts installed in $dir (manager command: antseed-fleet)" >&2
 
-if [[ "$REPO" == "keplia/kepliaantseed" ]]; then
-  echo "note: get.sh is still using the placeholder repository (keplia/kepliaantseed)." >&2
-  echo "      set ANTSEED_FLEET_REPO=owner/repo or host the files yourself." >&2
+# stdin is the curl pipe, so the installer cannot read answers from it.
+# Reconnect stdin to the real terminal; if there is none, /dev/null instead of
+# an empty pipe (which would look like "everyone pressed enter").
+if ( exec 0<>/dev/tty ) 2>/dev/null; then
+  exec bash "$dir/install.sh" "$@" </dev/tty
+else
+  exec bash "$dir/install.sh" "$@" </dev/null
 fi
-
-# The manager CLI is available now; the installer reads the rest from the terminal.
-exec bash "$dir/install.sh" "$@"

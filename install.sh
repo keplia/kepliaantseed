@@ -57,14 +57,33 @@ step() { printf '\n%s\n' "${C_B}${C_BOLD}▸ $*${C_0}"; }
 info() { printf '%s\n' "${C_B}==>${C_0} $*"; }
 ok()   { printf '%s\n' "${C_G}  ✔${C_0} $*"; }
 warn() { printf '%s\n' "${C_Y}  !${C_0} $*" >&2; }
-die()  { printf '%s\n' "${C_R}  ✘ $*${C_0}" >&2; exit "${2:-1}"; }
+die() { # die "message" [exit-code]
+  local code=1
+  if (( $# >= 2 )) && [[ ${!#} =~ ^[0-9]+$ ]]; then
+    code=${!#}
+    set -- "${@:1:$(($# - 1))}"
+  fi
+  printf '%s\n' "${C_R}  ✘ $*${C_0}" >&2
+  exit "$code"
+}
 
-# interactive only when both stdin and stdout are terminals
-interactive() { [[ $ASSUME_YES -eq 0 && -t 0 && -t 1 ]]; }
+# interactive only when we have a terminal to ask on. stdin is a pipe when the
+# script is started with "curl ... | sudo bash", so /dev/tty is what matters.
+have_tty() { ( exec 3<>/dev/tty ) 2>/dev/null; }
+
+interactive() {
+  [[ $ASSUME_YES -eq 0 ]] || return 1
+  [[ -t 1 ]] || return 1
+  have_tty
+}
+
+say() { # diagnostics; never fatal
+  if [[ -t 2 ]] || [[ -w /dev/tty ]]; then printf '%s\n' "$*" >&2 || true; fi
+}
 
 ask() { # ask "prompt" [default] -> echoes the answer
   local prompt=$1 default=${2:-} answer=
-  if interactive; then
+  if [[ $ASSUME_YES -eq 0 ]] && have_tty; then
     if [[ -n $default ]]; then
       read -r -p "$prompt [$default]: " answer </dev/tty || true
       printf '%s' "${answer:-$default}"
@@ -77,18 +96,22 @@ ask() { # ask "prompt" [default] -> echoes the answer
   fi
 }
 
-ask_secret() { # never echoed
+ask_secret() { # never echoed; reads from the terminal
   local prompt=$1 answer=
-  if interactive; then
+  if [[ $ASSUME_YES -eq 0 ]] && have_tty; then
     read -r -s -p "$prompt: " answer </dev/tty || true
     printf '\n' >/dev/tty
+  elif [[ $ASSUME_YES -eq 0 && ! -t 0 && ! -p /dev/stdin ]]; then
+    # stdin still has data (e.g. here-string); never block on an empty pipe
+    read -r answer || true
   fi
   printf '%s' "$answer"
 }
 
 confirm() { # confirm "question" -> 0 yes, 1 no
   local q=$1 answer
-  interactive || return 0
+  [[ $ASSUME_YES -eq 0 ]] || return 0
+  have_tty || return 0
   read -r -p "$q [Y/n]: " answer </dev/tty || true
   case ${answer:-y} in [yY]|"") return 0 ;; *) return 1 ;; esac
 }
@@ -491,8 +514,10 @@ step "Antseed fleet installer $VERSION"
 
 step "1/4 · Cloudflare API token"
 if [[ -z ${CF_API_TOKEN:-} ]]; then
-  cat <<'TXT'
-  Create a scoped token at https://dash.cloudflare.com/profile/api-tokens
+  cat <<'TXT' >&2
+
+  Create a scoped Cloudflare API token:
+    https://dash.cloudflare.com/profile/api-tokens
     (Create Token -> Create Custom Token)
 
     Account | Cloudflare Tunnel | Edit
@@ -503,9 +528,16 @@ if [[ -z ${CF_API_TOKEN:-} ]]; then
     Account Resources: your account
     Zone Resources:    your zone
 TXT
-  CF_API_TOKEN=$(ask_secret "  Paste the Cloudflare API token")
+  if [[ $ASSUME_YES -eq 0 ]] && ! have_tty; then
+    die "no terminal to type into. Run it in an interactive shell, or pass the value:
+  curl -fsSL https://raw.githubusercontent.com/keplia/kepliaantseed/main/get.sh |
+    sudo bash -s -- --token cf_xxx --domain example.com" 1
+  fi
+  while [[ -z ${CF_API_TOKEN:-} ]]; do
+    CF_API_TOKEN=$(ask_secret "  Paste the Cloudflare API token")
+    [[ -n $CF_API_TOKEN ]] || warn "token is empty - paste the cfut_... / cf_... value"
+  done
 fi
-[[ -n ${CF_API_TOKEN:-} ]] || die "no token given"
 export CF_API_TOKEN
 
 info "checking the token"
@@ -520,7 +552,15 @@ if [[ -z ${CF_DOMAIN:-} ]]; then
   if [[ -z $guess ]]; then
     guess=$(cf GET "/zones" 2>/dev/null | cfj '((j.result||[]).length===1 ? j.result[0].name : "")' || true)
   fi
-  CF_DOMAIN=$(ask "  Domain to create gateways under (e.g. example.com)" "${guess:-}")
+  if [[ $ASSUME_YES -eq 0 ]] && ! have_tty; then
+    die "no terminal to ask for the domain. Pass --domain example.com" 1
+  fi
+  while [[ -z ${CF_DOMAIN:-} ]]; do
+    CF_DOMAIN=$(ask "  Domain to create gateways under (e.g. example.com)" "${guess:-}")
+    [[ -n ${CF_DOMAIN:-} ]] && break
+    if [[ -n ${guess:-} ]]; then CF_DOMAIN=$guess; break; fi
+    warn "domain is required"
+  done
 fi
 [[ -n ${CF_DOMAIN:-} ]] || die "no domain given"
 # accept https://api.example.com/ or example.com and keep the zone part
@@ -562,7 +602,11 @@ else
   if [[ -z $count ]]; then
     while true; do
       count=$(ask "  How many instances do you want" "$rec")
-      [[ $count =~ ^[0-9]+$ ]] || { warn "enter a number"; interactive || die "COUNT must be numeric"; continue; }
+      [[ $count =~ ^[0-9]+$ ]] || {
+        warn "enter a number"
+        if [[ ${COUNT:-} != "" && ! $count =~ ^[0-9]+$ ]]; then die "COUNT must be numeric" 1; fi
+        continue
+      }
       (( count > rec )) && {
         warn "$count is above the recommendation ($rec) — the VPS may run out of memory"
         confirm "  Continue anyway?" || { count=""; continue; }
