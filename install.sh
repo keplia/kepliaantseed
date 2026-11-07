@@ -2,21 +2,26 @@
 # antseed-fleet — many independent Antseed gateways on one VPS.
 #
 # One command, interactive:
-#   bash install.sh          (or: curl -fsSL <url> | bash)
+#   bash install.sh          (or: curl -fsSL <get.sh> | sudo bash)
 #
-# It asks for the Cloudflare API token and the domain, inspects the VPS, shows
-# how many instances fit, asks how many to create, then builds them one by one.
-# Every instance gets its own system user, data dir, wallets, database, ports,
-# systemd units, Cloudflare tunnel and public hostname (api2, api3, api4, ...).
+#  1. asks for the Cloudflare API token (until now you had to remember the domain)
+#  2. lists every zone on the account and lets you pick one
+#  3. asks for the name: <NAME>1.<domain>, <NAME>2.<domain>, ...
+#  4. inspects the VPS, shows the sizing table and how many instances fit,
+#     then asks how many to create
+#  5. builds them one by one: system user, data dir, wallets, database, ports,
+#     systemd units, Cloudflare tunnel and public hostname
 #
 # Non-interactive (CI, cloud-init):
-#   CF_API_TOKEN=... CF_DOMAIN=example.com COUNT=2 bash install.sh --yes
+#   CF_API_TOKEN=... DOMAIN=example.com NAME=api COUNT=2 bash install.sh --yes
+#
+#   --name api     -> api1.example.com, api2.example.com, ...
 #
 # Exit codes: 0 ok, 1 usage/validation, 2 cancelled, 3 failed mid-way.
 
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PREFIX="${ANTSEED_FLEET_PREFIX:-antseed}"
 STATE_DIR="/etc/${PREFIX}-fleet"
 UNIT_DIR="/etc/systemd/system"
@@ -27,15 +32,20 @@ INSTALL_SH="https://antseed.com/install.sh"
 
 ASSUME_YES=0
 
+INSTANCE_NAME=""
+DOMAIN=""
+
 # flags (also settable by environment)
 while (( $# )); do
   case $1 in
     --token)   CF_API_TOKEN=$2; shift 2 ;;
-    --domain)  CF_DOMAIN=$2; shift 2 ;;
+    --domain)  DOMAIN=$2; shift 2 ;;
+    --name)    INSTANCE_NAME=$2; shift 2 ;;
+    --mode)    die "--mode is no longer supported: every instance gets its own subdomain (api1.example.com)" 1 ;;
     --count)   COUNT=$2; shift 2 ;;
     --yes|-y)  ASSUME_YES=1; shift ;;
     --version) echo "antseed-fleet $VERSION"; exit 0 ;;
-    --help|-h) printf '%s\n' "usage: install.sh [--token T] [--domain D] [--count N] [--yes]"; exit 0 ;;
+    --help|-h) printf '%s\n' "usage: install.sh [--token T] [--domain D] [--name N] [--count N] [--yes]"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -75,10 +85,6 @@ interactive() {
   [[ $ASSUME_YES -eq 0 ]] || return 1
   [[ -t 1 ]] || return 1
   have_tty
-}
-
-say() { # diagnostics; never fatal
-  if [[ -t 2 ]] || [[ -w /dev/tty ]]; then printf '%s\n' "$*" >&2 || true; fi
 }
 
 ask() { # ask "prompt" [default] -> echoes the answer
@@ -176,18 +182,21 @@ cf_verify() {
   local status
   status=$(cf GET /user/tokens/verify 2>/dev/null | cfj 'j.result.status' || true)
   [[ $status == active ]] || die "Cloudflare token is not active"
-  ACCOUNT_ID=$(cf GET /accounts | cfj 'j.result[0].id')
-  ACCOUNT_NAME=$(cf GET /accounts | cfj 'j.result[0].name')
-  [[ -n $ACCOUNT_ID ]] || die "token cannot list accounts (needs Account Settings: Read)"
+  local accounts
+  accounts=$(cf GET /accounts | cfj '(j.result||[]).map(a => a.id + "\t" + a.name).join("\n")')
+  [[ -n $accounts ]] || die "token cannot list accounts (needs Account Settings: Read)"
+  ACCOUNT_ID=$(head -1 <<<"$accounts" | cut -f1)
+  ACCOUNT_NAME=$(head -1 <<<"$accounts" | cut -f2)
+}
+
+list_zones() { # one "name<TAB>id<TAB>status" per line
+  cf GET "/zones?per_page=50" | cfj '(j.result||[]).map(z => z.name + "\t" + z.id + "\t" + z.status).join("\n")'
 }
 
 cf_zone_id() {
-  local cur=$1 z
-  while [[ $cur == *.* ]]; do
-    z=$(cf GET "/zones?name=$cur" 2>/dev/null | cfj 'j.result[0]?.id || ""' || true)
-    [[ -n $z ]] && { printf '%s' "$z"; return 0; }
-    cur=${cur#*.}
-  done
+  local name=$1 z
+  z=$(cf GET "/zones?name=$name" 2>/dev/null | cfj 'j.result[0]?.id || ""' || true)
+  [[ -n $z ]] && { printf '%s' "$z"; return 0; }
   return 1
 }
 
@@ -207,6 +216,26 @@ mem_total_mib() { awk '/MemTotal/ { printf "%d", $2 / 1024 }' /proc/meminfo; }
 mem_avail_mib() { awk '/MemAvailable/ { printf "%d", $2 / 1024 }' /proc/meminfo; }
 disk_avail_mib() { df -Pm /var/lib | awk 'NR == 2 { print $4 }'; }
 
+print_sizing_table() { # print_sizing_table <fits-now> <budget-per-instance> <total-ram-of-this-vps>
+  local fits=$1 mine=$(( ($3 + 512) / 1024 )) t rec row total fit
+  printf '    %-9s %-16s %-9s %s\n' "RAM VPS" "BUDGET" "FITS" "MARK"
+  printf '    %-9s %-16s %-9s %s\n' "--------" "----------------" "---------" "----"
+  for t in 1024 2048 3072 4096 6144 8192 12288 16384 24576 32768 49152 65536; do
+    rec=$(($2 > 0 ? (t - MEM_RESERVE_MIB) / $2 : 0))
+    (( rec < 1 )) && rec=1
+    if (( t % 1024 == 0 )); then
+      printf -v total '%d GB' $((t / 1024))
+    else
+      printf -v total '%.1f GB' "$(awk -v m="$t" 'BEGIN { print m / 1024 }')"
+    fi
+    fit=""
+    (( t / 1024 == mine )) && fit="  <- this VPS"
+    printf '    %-9s %-16s %-9s%s\n' "$total" "$2 MiB" "$rec" "$fit"
+  done
+  printf '    %-9s %-16s %-9s%s\n' "now" "free RAM" "$fits" "  <- can be created right now"
+}
+
+# how many new instances this VPS can take right now
 recommend_count() {
   local avail by_mem by_disk
   avail=$(mem_avail_mib)
@@ -214,6 +243,35 @@ recommend_count() {
   (( by_mem < 0 )) && by_mem=0
   by_disk=$(( $(disk_avail_mib) / DISK_PER_INSTANCE_MIB ))
   echo "$by_mem $by_disk $avail"
+}
+
+# ------------------------------------------------------------- naming
+
+sanitize_name() { # lowercase, [a-z0-9-], no leading/trailing dash
+  local n
+  n=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/--*/-/g' -e 's/^-//' -e 's/-$//')
+  printf '%s' "$n"
+}
+
+host_for() { # host_for <name> <n> <domain>
+  printf '%s%d.%s' "$1" "$2" "$3"
+}
+
+next_host_num() { # next number for the given name, taken from the local instances
+  local name=$1 max=0 host
+  for host in $(existing_instances | awk '{ print $2 }'); do
+    if [[ $host =~ ^${name}([0-9]+)\. ]]; then
+      (( BASH_REMATCH[1] > max )) && max=${BASH_REMATCH[1]}
+    fi
+  done
+  echo $((max + 1))
+}
+
+host_taken_by_other() { # host_taken_by_other <host> -> router of the CNAME, if any
+  local rec
+  rec=$(cf GET "/zones/$ZONE_ID/dns_records?name=$1" 2>/dev/null |
+    cfj '(j.result[0] && j.result[0].content) || ""' || true)
+  printf '%s' "$rec"
 }
 
 # ------------------------------------------------------------- instances
@@ -243,12 +301,6 @@ next_index() {
   used=$(instance_names)
   while grep -qx "${PREFIX}${i}" <<<"$used"; do i=$((i + 1)); done
   echo "$i"
-}
-
-next_host_num() {
-  existing_instances | awk '
-    { n = $2; sub(/\..*/, "", n); gsub(/[^0-9]/, "", n); if (n != "" && n + 0 > m) m = n + 0 }
-    END { print m + 1 }'
 }
 
 load_instance() {
@@ -282,7 +334,7 @@ baseline_ports() {
 
 alloc_ports() {
   local gw=8379 buyer=8377 reserved base all
-  reserved=$(existing_instances | awk '{ print $1 }' | while read -r n; do
+  reserved=$(instance_names | while read -r n; do
     local f="$STATE_DIR/$n.env"
     [[ -f $f ]] && ( . "$f"; echo "$GW_PORT $BUYER_PORT" )
   done)
@@ -382,18 +434,11 @@ WantedBy=multi-user.target
 UNIT
 }
 
-create_one() {
-  local host=$1 idx user inst home gw_port buyer_port zone_id tunnel_id tunnel_name
-  idx=""
-  if [[ $host =~ ^api([0-9]+)\. ]]; then
-    idx=${BASH_REMATCH[1]}
-    instance_exists "${PREFIX}${idx}" && idx=""
-  fi
-  [[ -n $idx ]] || idx=$(next_index)
-  user="${PREFIX}${idx}"
-  inst=$user
-  home="/var/lib/$user"
+create_one() { # create_one <instance> <host> <zone-id> <domain>
+  local inst=$1 host=$2 zone_id=$3 domain=$4
+  local user=$inst home gw_port buyer_port tunnel_id tunnel_name
 
+  home="/var/lib/$user"
   info "creating $inst for $host"
 
   if ! id "$user" >/dev/null 2>&1; then
@@ -407,7 +452,6 @@ create_one() {
   read -r gw_port buyer_port <<<"$(alloc_ports)"
   ok "ports gateway=$gw_port buyer=$buyer_port"
 
-  zone_id=$(cf_zone_id "$CF_DOMAIN") || die "zone lookup failed for $CF_DOMAIN"
   tunnel_name="$inst-gateway"
   tunnel_id=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$tunnel_name&is_deleted=false" 2>/dev/null |
     cfj 'j.result[0]?.id || ""' || true)
@@ -424,17 +468,18 @@ create_one() {
     >/dev/null
   ok "ingress $host -> http://localhost:$gw_port"
 
-  local dns_name=$host dns_body rec_id
-  [[ $host == *".$CF_DOMAIN" ]] && dns_name=${host%".$CF_DOMAIN"}
+  local dns_name=$host dns_ok=1 dns_body rec_id
+  [[ $host == *".$domain" ]] && dns_name=${host%".$domain"}
   rec_id=$(cf GET "/zones/$zone_id/dns_records?name=$host" | cfj 'j.result[0]?.id || ""')
   dns_body="{\"type\":\"CNAME\",\"name\":\"$dns_name\",\"content\":\"$tunnel_id.cfargotunnel.com\",\"proxied\":true,\"ttl\":1}"
   if [[ -n $rec_id ]]; then
-    cf PUT "/zones/$zone_id/dns_records/$rec_id" "$dns_body" >/dev/null
-    ok "DNS $host updated (CNAME -> tunnel)"
+    cf PUT "/zones/$zone_id/dns_records/$rec_id" "$dns_body" >/dev/null &&
+      ok "DNS $host updated (CNAME -> tunnel)" || { warn "DNS update failed for $host"; dns_ok=0; }
   else
-    cf POST "/zones/$zone_id/dns_records" "$dns_body" >/dev/null
-    ok "DNS $host created (CNAME -> tunnel)"
+    cf POST "/zones/$zone_id/dns_records" "$dns_body" >/dev/null &&
+      ok "DNS $host created (CNAME -> tunnel)" || { warn "DNS create failed for $host"; dns_ok=0; }
   fi
+  (( dns_ok )) || die "cannot point $host at the tunnel" 3
 
   local tunnel_token
   tunnel_token=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$tunnel_id/token" | cfj 'j.result')
@@ -479,6 +524,8 @@ create_one() {
       echo "USER=$user"
       echo "HOME_DIR=$home"
       echo "HOST=$host"
+      echo "MODE=sub"
+      echo "DOMAIN=$domain"
       echo "GW_PORT=$gw_port"
       echo "BUYER_PORT=$buyer_port"
       echo "TUNNEL_ID=$tunnel_id"
@@ -520,7 +567,9 @@ create_one() {
 
 step "Antseed fleet installer $VERSION"
 
-step "1/4 · Cloudflare API token"
+# ---------------------------------------------------------- 1/5 token
+
+step "1/5 · Cloudflare API token"
 if [[ -z ${CF_API_TOKEN:-} ]]; then
   cat <<'TXT' >&2
 
@@ -539,7 +588,7 @@ TXT
   if [[ $ASSUME_YES -eq 0 ]] && ! have_tty; then
     die "no terminal to type into. Run it in an interactive shell, or pass the value:
   curl -fsSL https://raw.githubusercontent.com/keplia/kepliaantseed/main/get.sh |
-    sudo bash -s -- --token cf_xxx --domain example.com" 1
+    sudo bash -s -- --token cf_xxx --domain example.com --name api" 1
   fi
   while [[ -z ${CF_API_TOKEN:-} ]]; do
     CF_API_TOKEN=$(ask_secret "  Paste the Cloudflare API token")
@@ -552,53 +601,134 @@ info "checking the token"
 cf_verify
 ok "account: $ACCOUNT_NAME"
 
-step "2/4 · Domain"
-if [[ -z ${CF_DOMAIN:-} ]]; then
-  local_first=$(existing_instances | awk 'NR==1 { print $2 }')
-  guess=""
-  if [[ -n $local_first ]]; then guess=${local_first#*.}; fi
-  if [[ -z $guess ]]; then
-    guess=$(cf GET "/zones" 2>/dev/null | cfj '((j.result||[]).length===1 ? j.result[0].name : "")' || true)
+# ---------------------------------------------------------- 2/5 domain
+
+step "2/5 · Domain"
+ZONES=$(list_zones)
+[[ -n $ZONES ]] || die "this token cannot see any zone — check Zone | Zone | Read for your zone" 1
+
+mapfile -t ZONE_NAMES < <(cut -f1 <<<"$ZONES")
+mapfile -t ZONE_IDS < <(cut -f2 <<<"$ZONES")
+mapfile -t ZONE_STATUS < <(cut -f3 <<<"$ZONES")
+
+zone_id_for() {
+  local i
+  for i in "${!ZONE_NAMES[@]}"; do
+    [[ ${ZONE_NAMES[$i]} == "$1" ]] && { printf '%s' "${ZONE_IDS[$i]}"; return 0; }
+  done
+  return 1
+}
+
+if [[ -z $DOMAIN ]]; then
+  def=1
+  first_host=$(existing_instances | awk 'NR==1 { print $2 }')
+  if [[ -n $first_host ]]; then
+    root=$(zone_root "$first_host" || true)
+    for i in "${!ZONE_NAMES[@]}"; do [[ ${ZONE_NAMES[$i]} == "$root" ]] && { def=$((i + 1)); break; }; done
   fi
+
+  printf '    %-4s %-34s %s\n' "#" "DOMAIN" "STATUS"
+  for i in "${!ZONE_NAMES[@]}"; do
+    printf '    %-4s %-34s %s\n' "$((i + 1))" "${ZONE_NAMES[$i]}" "${ZONE_STATUS[$i]}"
+  done
+  echo
+  printf '%s\n' "${C_D}    Type a number, or a zone that is not in the list.${C_0}"
+
   if [[ $ASSUME_YES -eq 0 ]] && ! have_tty; then
     die "no terminal to ask for the domain. Pass --domain example.com" 1
   fi
-  while [[ -z ${CF_DOMAIN:-} ]]; do
-    CF_DOMAIN=$(ask "  Domain to create gateways under (e.g. example.com)" "${guess:-}")
-    [[ -n ${CF_DOMAIN:-} ]] && break
-    if [[ -n ${guess:-} ]]; then CF_DOMAIN=$guess; break; fi
-    warn "domain is required"
+  pick=${DOMAIN_PICK:-}
+  while [[ -z $DOMAIN ]]; do
+    pick=$(ask "  Which domain" "${pick:-$def}")
+    if [[ $pick =~ ^[0-9]+$ ]]; then
+      if (( pick >= 1 && pick <= ${#ZONE_NAMES[@]} )); then
+        DOMAIN=${ZONE_NAMES[$((pick - 1))]}
+      else
+        warn "no domain number $pick — pick 1..${#ZONE_NAMES[@]}"
+        pick=""
+      fi
+    else
+      DOMAIN=$(printf '%s' "$pick" | tr '[:upper:]' '[:lower:]')
+      [[ $DOMAIN == *.* ]] || { warn "'$DOMAIN' does not look like a domain"; DOMAIN=""; }
+    fi
   done
 fi
-[[ -n ${CF_DOMAIN:-} ]] || die "no domain given"
-# accept https://api.example.com/ or example.com and keep the zone part
-CF_DOMAIN=${CF_DOMAIN#http://}; CF_DOMAIN=${CF_DOMAIN#https://}
-CF_DOMAIN=${CF_DOMAIN%%/*}
-if ! cf_zone_id "$CF_DOMAIN" >/dev/null; then
-  trimmed=${CF_DOMAIN#*.}
-  if cf_zone_id "$trimmed" >/dev/null; then CF_DOMAIN=$trimmed; fi
-fi
-export CF_DOMAIN
-cf_zone_id "$CF_DOMAIN" >/dev/null || die "zone '$CF_DOMAIN' not found on this Cloudflare account"
-ok "zone: $CF_DOMAIN  (hosts will be apiN.$CF_DOMAIN)"
 
-step "3/4 · This VPS"
+# accept https://api.example.com/ and keep the zone part
+DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN#https://}
+DOMAIN=${DOMAIN%%/*}
+if ! zone_id_for "$DOMAIN" >/dev/null; then
+  trimmed=${DOMAIN#*.}
+  if zone_id_for "$trimmed" >/dev/null; then
+    warn "using the zone $trimmed instead of $DOMAIN"
+    DOMAIN=$trimmed
+  fi
+fi
+ZONE_ID=$(zone_id_for "$DOMAIN") || die "zone '$DOMAIN' not found on this Cloudflare account (the token sees: ${ZONE_NAMES[*]})" 1
+ok "domain: $DOMAIN   (zone $ZONE_ID)"
+
+# ---------------------------------------------------------- 3/5 name
+
+step "3/5 · Name"
+san_name() {
+  local n
+  n=$(sanitize_name "$1")
+  [[ -n $n ]] || return 1
+  [[ $n =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  [[ $n == *.* ]] && return 1
+  printf '%s' "$n"
+}
+
+same_name_used() { # how many instances already use this prefix
+  local name=$1 n=0 h
+  for h in $(existing_instances | awk '{ print $2 }'); do
+    if [[ $h =~ ^${name}[0-9]+\. ]]; then n=$((n + 1)); fi
+  done
+  echo "$n"
+}
+
+if [[ -z $INSTANCE_NAME ]]; then
+  if [[ $ASSUME_YES -eq 0 ]] && ! have_tty; then
+    die "no terminal to ask for the name. Pass --name api" 1
+  fi
+  guess="api"
+  for h in $(existing_instances | awk '{ print $2 }'); do
+    if [[ $h =~ ^([a-z0-9-]+)[0-9]+\. ]]; then guess=${BASH_REMATCH[1]}; break; fi
+  done
+  INSTANCE_NAME=$(ask "  Name for the instances (letters, digits, dash)" "$guess")
+fi
+INSTANCE_NAME=$(san_name "$INSTANCE_NAME") || die "invalid name — use letters, digits and dashes, e.g. api or gateway" 1
+
+prio=""
+[[ $INSTANCE_NAME =~ ^(buyer|gateway|tunnel|cloudflared|antseed|console|admin|root|system)$ ]] &&
+  prio="  (this name is used by the base service on ports 8377/8379; instances still use $INSTANCE_NAME 1, $INSTANCE_NAME 2, ...)"
+
+echo
+printf '    %-14s %s\n' "Domain" "$DOMAIN"
+printf '    %-14s %s\n' "Name" "$INSTANCE_NAME"
+printf '    %-14s %s\n' "1st host" "https://$(host_for "$INSTANCE_NAME" 1 "$DOMAIN")"
+printf '    %-14s %s\n' "then" "https://$(host_for "$INSTANCE_NAME" 2 "$DOMAIN"), https://$(host_for "$INSTANCE_NAME" 3 "$DOMAIN"), ..."
+[[ -n $prio ]] && printf '%s\n' "${C_D}   $prio${C_0}"
+
+# ---------------------------------------------------------- 4/5 how many
+
+step "4/5 · This VPS and how many"
 ensure_cli
 read -r rec by_disk avail <<<"$(recommend_count)"
 used=$(existing_instances | wc -l)
+cpu_model=$(awk -F': ' '/model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true)
+mem_total=$(mem_total_mib)
+disk_free=$(disk_avail_mib)
+already=$(same_name_used "$INSTANCE_NAME")
 
-printf '    %-24s %s\n' "CPUs" "$(nproc)"
+printf '    %-24s %s\n' "CPUs" "$(nproc)${cpu_model:+ × $cpu_model}"
+printf '    %-24s %s MiB (%s GB)\n' "RAM total" "$mem_total" "$(awk -v m="$mem_total" 'BEGIN { printf "%.1f", m / 1024 }')"
 printf '    %-24s %s MiB\n' "RAM available" "$avail"
-printf '    %-24s %s MiB\n' "Disk free" "$(disk_avail_mib)"
+printf '    %-24s %s MiB (%s GB)\n' "Disk free" "$disk_free" "$(awk -v m="$disk_free" 'BEGIN { printf "%.0f", m / 1024 }')"
 printf '    %-24s %s\n' "Instances already here" "$used"
 printf '    %-24s %s MiB per instance\n' "Memory budget" "$MEM_PER_INSTANCE_MIB"
 echo
-printf '%s\n' "${C_D}    Sizing: 2 GB→1   4 GB→3   8 GB→7   16 GB→15   32 GB→33${C_0}"
-if (( used > 0 )); then
-  echo
-  printf '    %-12s %s\n' "NAME" "HOST"
-  existing_instances | while read -r n h; do printf '    %-12s %s\n' "$n" "$h"; done
-fi
+print_sizing_table "$rec" "$MEM_PER_INSTANCE_MIB" "$mem_total"
 echo
 
 if (( rec == 0 )); then
@@ -612,7 +742,7 @@ else
       count=$(ask "  How many instances do you want" "$rec")
       [[ $count =~ ^[0-9]+$ ]] || {
         warn "enter a number"
-        if [[ ${COUNT:-} != "" && ! $count =~ ^[0-9]+$ ]]; then die "COUNT must be numeric" 1; fi
+        if [[ ${COUNT:-} != "" ]]; then die "COUNT must be numeric" 1; fi
         continue
       }
       (( count > rec )) && {
@@ -627,19 +757,45 @@ fi
 
 (( count > 0 )) || { warn "nothing to do"; exit 0; }
 
-step "4/4 · Creating $count instance(s)"
-start_num=$(next_host_num)
+# ---------------------------------------------------------- 5/5 create
+
+start_num=$(next_host_num "$INSTANCE_NAME" "$DOMAIN")
 hosts=()
+names=()
 for (( i = 0; i < count; i++ )); do
-  hosts+=("api$((start_num + i)).$CF_DOMAIN")
+  hosts+=("$(host_for "$INSTANCE_NAME" "$((start_num + i))" "$DOMAIN")")
 done
-printf '    %s\n' "${hosts[@]}"
+
+# instance ids: keep antseedN going, never colliding with an existing one
+idx=1
+for (( i = 0; i < count; i++ )); do
+  while instance_exists "${PREFIX}${idx}"; do idx=$((idx + 1)); done
+  names+=("${PREFIX}${idx}")
+  idx=$((idx + 1))
+done
+
+# hosts that already belong to another tunnel must not be hijacked silently
+for h in "${hosts[@]}"; do
+  router=$(host_taken_by_other "$h")
+  if [[ -n $router ]]; then
+    warn "$h already points to ${router%%.*}.cfargotunnel.com"
+    confirm "  Overwrite it?" || die "aborted — pick another name with --name" 2
+    break
+  fi
+done
+
+step "5/5 · Creating $count instance(s)"
+printf '    %-14s %s\n' "INSTANCE" "PUBLIC URL"
+for i in "${!hosts[@]}"; do
+  printf '    %-14s https://%s/v1\n' "${names[$i]}" "${hosts[$i]}"
+done
 echo
 confirm "  Proceed?" || { warn "cancelled"; exit 2; }
 
 created=0
-for h in "${hosts[@]}"; do
-  create_one "$h" || die "failed while creating $h (instances created so far: $created)" 3
+for i in "${!hosts[@]}"; do
+  create_one "${names[$i]}" "${hosts[$i]}" "$ZONE_ID" "$DOMAIN" ||
+    die "failed while creating ${hosts[$i]} (instances created so far: $created)" 3
   created=$((created + 1))
   echo
 done

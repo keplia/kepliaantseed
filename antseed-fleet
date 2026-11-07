@@ -18,7 +18,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PREFIX="${ANTSEED_FLEET_PREFIX:-antseed}"
 STATE_DIR="/etc/${PREFIX}-fleet"
 UNIT_DIR="/etc/systemd/system"
@@ -70,7 +70,7 @@ cmd_list() {
   local names n
   names=$(instance_names)
   [[ -n $names ]] || { echo "no instances yet (run: bash install.sh)"; return 0; }
-  printf '%-10s %-26s %-6s %-6s %-10s %-10s %s\n' NAME HOST GW BUYER MEM STATE TUNNEL
+  printf '%-10s %-28s %-6s %-6s %-10s %-10s %s\n' NAME HOST GW BUYER MEM STATE TUNNEL
   while read -r n; do
     [[ -n $n ]] || continue
     (
@@ -79,7 +79,7 @@ cmd_list() {
       mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{ printf "%d MiB", $1 / 1024 }' || true)
       [[ -n $mem ]] || mem="-"
       st=$(systemctl is-active "$INSTANCE-gateway" 2>/dev/null || echo unknown)
-      printf '%-10s %-26s %-6s %-6s %-10s %-10s %s\n' \
+      printf '%-10s %-28s %-6s %-6s %-10s %-10s %s\n' \
         "$n" "$HOST" "$GW_PORT" "$BUYER_PORT" "$mem" "$st" "${TUNNEL_ID:0:8}"
     )
   done <<<"$names"

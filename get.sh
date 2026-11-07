@@ -2,7 +2,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/keplia/kepliaantseed/main/get.sh | sudo bash
 #
 # Opsi:
-#   curl -fsSL .../get.sh | sudo bash -s -- --token 'cf_...' --domain example.com --count 2
+#   curl -fsSL .../get.sh | sudo bash -s -- --token 'cf_...' --domain example.com --name api --count 2
 #
 set -Eeuo pipefail
 
