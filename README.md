@@ -18,6 +18,8 @@ Itu saja. Script akan menanyakan:
 
 Hasilnya: `api2.seaku.dev`, `api3.seaku.dev`, `api4.seaku.dev`, … masing-masing dengan API key, wallet, console, dan tunnel sendiri. Kalau Antseed CLI belum ada, dipasang otomatis.
 
+Butuh terminal interaktif (script membaca jawaban dari `/dev/tty`). Kalau tidak ada terminal sama sekali, script berhenti dengan pesan jelas dan memberi perintah yang harus dipakai — tidak pernah lanjut diam-diam tanpa token.
+
 Tanpa interaksi (cloud-init / CI):
 
 ```bash
