@@ -163,8 +163,9 @@ cf() {
   fi
 }
 
-cfj() {
+cfj() { # cfj <js-expression> [argv...]
   local expr=$1
+  shift || true
   node -e '
 let s = "";
 process.stdin.on("data", d => s += d).on("end", () => {
@@ -172,9 +173,10 @@ process.stdin.on("data", d => s += d).on("end", () => {
   try { j = JSON.parse(s); }
   catch (e) { console.error("bad JSON from Cloudflare"); process.exit(1); }
   if (j.success === false) { console.error("Cloudflare error:", JSON.stringify(j.errors)); process.exit(1); }
+  const argv = process.argv.slice(2);
   const v = eval(process.argv[1]);
   process.stdout.write(v === undefined || v === null ? "" : String(v));
-});' "$expr"
+});' "$expr" "$@"
 }
 
 cf_verify() {
@@ -272,6 +274,24 @@ host_taken_by_other() { # host_taken_by_other <host> -> router of the CNAME, if 
   rec=$(cf GET "/zones/$ZONE_ID/dns_records?name=$1" 2>/dev/null |
     cfj '(j.result[0] && j.result[0].content) || ""' || true)
   printf '%s' "$rec"
+}
+
+# every instance needs its own tunnel: cloudflared replaces the whole ingress
+# list on each config version, so two instances sharing one tunnel would knock
+# each other's hostname off.
+assert_tunnel_owner() { # assert_tunnel_owner <instance> <tunnel-id>
+  local owner remote
+  remote=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$2" 2>/dev/null |
+    cfj 'j.result?.name || ""' || true)
+  [[ -n $remote ]] || die "tunnel $2 does not exist" 3
+  for owner in $(instance_names); do
+    [[ $owner == "$1" ]] && continue
+    local other
+    other=$(sed -n 's/^TUNNEL_ID=//p' "$(state_file "$owner")" 2>/dev/null || true)
+    [[ $other == "$2" ]] && die "tunnel $2 already belongs to $owner — refusing to share it" 3
+  done
+  [[ $remote == "$1-gateway" ]] ||
+    die "tunnel $2 is named '$remote', not '$1-gateway' — refusing to reuse it" 3
 }
 
 # ------------------------------------------------------------- instances
@@ -462,6 +482,7 @@ create_one() { # create_one <instance> <host> <zone-id> <domain>
       "{\"name\":\"$tunnel_name\",\"config_src\":\"cloudflare\"}" | cfj 'j.result.id')
     ok "tunnel $tunnel_name ($tunnel_id)"
   fi
+  assert_tunnel_owner "$inst" "$tunnel_id"
 
   cf PUT "/accounts/$ACCOUNT_ID/cfd_tunnel/$tunnel_id/configurations" \
     "{\"config\":{\"ingress\":[{\"hostname\":\"$host\",\"service\":\"http://localhost:$gw_port\"},{\"service\":\"http_status:404\"}]}}" \
