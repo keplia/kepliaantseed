@@ -14,6 +14,8 @@
 #   logs NAME [-f]           gateway + buyer + cloudflared logs
 #   restart|start|stop [NAME]
 #   remove NAME [--keys]     delete services (--keys also deletes data)
+#   restore [NAME]           put the tunnel ingress + DNS back on the host
+#                            recorded for the instance (fixes a hijacked host)
 #   doctor                   diagnose the deployment
 #
 set -Eeuo pipefail
@@ -181,6 +183,41 @@ cmd_remove() {
   warn "tunnel $tunnel and DNS $host remain in Cloudflare — delete them in the dashboard if unused"
 }
 
+cmd_restore() {
+  local name=${1:-} names n host tunnel port rid
+  [[ -n ${CF_API_TOKEN:-} ]] || die "set CF_API_TOKEN to your Cloudflare token (Tunnel + DNS edit)"
+  command -v node >/dev/null || die "node is required to talk to Cloudflare"
+  if [[ -n $name ]]; then names=$name; else names=$(instance_names); fi
+  [[ -n $names ]] || die "no instances"
+  while read -r n; do
+    [[ -n $n ]] || continue
+    load_instance "$n"
+    host=$HOST; tunnel=$TUNNEL_ID; port=$GW_PORT
+    local zone=${ZONE_ID:-} api=https://api.cloudflare.com/client/v4
+    local acc
+    acc=$(curl -fsS -m 30 "$api/accounts" -H "Authorization: Bearer $CF_API_TOKEN" |
+      node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.result&&j.result[0]?j.result[0].id:"")})') ||
+      die "cannot list accounts with this token"
+    curl -fsS -m 30 -X PUT "$api/accounts/$acc/cfd_tunnel/$tunnel/configurations" \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+      -d "{\"config\":{\"ingress\":[{\"hostname\":\"$host\",\"service\":\"http://localhost:$port\"},{\"service\":\"http_status:404\"}],\"warp-routing\":{\"enabled\":false}}}" >/dev/null ||
+      die "cannot update the tunnel for $n"
+    ok "$n ingress $host -> localhost:$port"
+    rid=$(curl -fsS -m 30 "$api/zones/$zone/dns_records?name=$host" -H "Authorization: Bearer $CF_API_TOKEN" |
+      node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.result&&j.result[0]?j.result[0].id:"")})')
+    [[ -n $rid ]] || die "no DNS record for $host"
+    curl -fsS -m 30 -X PUT "$api/zones/$zone/dns_records/$rid" -H "Authorization: Bearer $CF_API_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{\"type\":\"CNAME\",\"name\":\"${host%%.*}\",\"content\":\"$tunnel.cfargotunnel.com\",\"proxied\":true,\"ttl\":1}" >/dev/null ||
+      die "cannot update DNS for $host"
+    ok "$n DNS $host -> ${tunnel:0:8}"
+  done <<<"$names"
+  echo
+  echo "  waiting for cloudflared to pick up the config ..."
+  sleep 8
+  cmd_status "$name"
+}
+
 cmd_doctor() {
   local n
   echo "${C_BOLD}CLI${C_0}"
@@ -210,7 +247,7 @@ install_script() {
 }
 
 cmd_help() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
   echo
   echo "create more instances:"
   if f=$(install_script); then echo "  sudo bash $f"; else echo "  sudo bash install.sh"; fi
@@ -234,6 +271,7 @@ case ${1:-help} in
   stop)      shift; each_instance stop_one "$@" ;;
   create)    shift; cmd_create "$@" ;;
   remove|rm) shift; cmd_remove "$@" ;;
+  restore)   shift; cmd_restore "$@" ;;
   doctor)    cmd_doctor ;;
   version|-v|--version) echo "antseed-fleet $VERSION" ;;
   help|-h|--help|"") cmd_help ;;
