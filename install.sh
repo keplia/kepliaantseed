@@ -265,7 +265,13 @@ as_instance() {
   runuser -u "$user" -- env HOME="$home" PATH="$CLI_NODE_PATH:/usr/bin:/bin" "$CLI_BIN" "$@"
 }
 
-port_busy() { ss -Hltnu 2>/dev/null | awk '{ print $4" "$5 }' | grep -qE "[:.]$1( |\$)"; }
+port_busy() { # true when anything listens on (or connects from) that port
+  ss -Hltnu 2>/dev/null |
+    awk -v p="$1" '
+      { n = split($4, a, /[:.]/); if (a[n] == p) f = 1
+        n = split($5, b, /[:.]/); if (b[n] == p) f = 1 }
+      END { exit f ? 0 : 1 }'
+}
 
 baseline_ports() {
   local unit="$UNIT_DIR/antseed-buyer.service" bport=""
@@ -285,7 +291,9 @@ alloc_ports() {
 $reserved"
   all=$reserved
 
-  while port_busy "$gw" || grep -qE "^$gw " <<<"$all"; do gw=$((gw + 1)); done
+  while port_busy "$gw" || grep -qE "^$gw " <<<"$all" || grep -qxE "[0-9]+ $gw" <<<"$all"; do
+    gw=$((gw + 1))
+  done
   while port_busy "$buyer" || grep -qxE "[0-9]+ $buyer" <<<"$all" || [[ $buyer == "$gw" ]]; do
     buyer=$((buyer + 1))
   done
