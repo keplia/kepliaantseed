@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# antseed-fleet — manage the independent Antseed gateways created by install.sh.
+#
+# Instances are independent: system user, data dir, wallets, database, ports,
+# systemd units, Cloudflare tunnel and hostname (api2, api3, ...). Creating more
+# is always the same flow: bash install.sh
+#
+# Commands
+#   list                     instances, ports, memory, host, state
+#   status [NAME]            systemd + live public API check
+#   keys NAME [--label L]    create another API key
+#   link NAME                new one-time console setup link
+#   recover NAME             recovery link for a claimed console
+#   logs NAME [-f]           gateway + buyer + cloudflared logs
+#   restart|start|stop [NAME]
+#   remove NAME [--keys]     delete services (--keys also deletes data)
+#   doctor                   diagnose the deployment
+#
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+PREFIX="${ANTSEED_FLEET_PREFIX:-antseed}"
+STATE_DIR="/etc/${PREFIX}-fleet"
+UNIT_DIR="/etc/systemd/system"
+CLI_BIN="/opt/antseed/current/bin/antseed"
+CLI_NODE_PATH="/opt/antseed/node/bin"
+
+if [[ -t 1 ]]; then
+  C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_D=$'\033[2m'; C_BOLD=$'\033[1m'; C_0=$'\033[0m'
+else
+  C_G=''; C_Y=''; C_B=''; C_D=''; C_BOLD=''; C_0=''
+fi
+ok()   { printf '%s\n' "${C_G}  ✔${C_0} $*"; }
+warn() { printf '%s\n' "${C_Y}  !${C_0} $*" >&2; }
+die()  { printf '%s\n' "  ✘ $*" >&2; exit 1; }
+
+state_file() { echo "$STATE_DIR/$1.env"; }
+
+instance_names() {
+  local f
+  for f in "$STATE_DIR"/*.env; do
+    [[ -e $f ]] || continue
+    basename "$f" .env
+  done | sort -V
+}
+
+existing_instances() {
+  local n
+  while read -r n; do
+    [[ -n $n ]] || continue
+    ( . "$(state_file "$n")"; echo "$INSTANCE $HOST" )
+  done <<<"$(instance_names)"
+}
+
+load_instance() {
+  local f
+  [[ -n ${1:-} ]] || die "instance name required (see: antseed-fleet list)"
+  f=$(state_file "$1")
+  [[ -f $f ]] || die "instance '$1' not found (see: antseed-fleet list)"
+  . "$f"
+}
+
+as_instance() {
+  local user=$1 home=$2
+  shift 2
+  runuser -u "$user" -- env HOME="$home" PATH="$CLI_NODE_PATH:/usr/bin:/bin" "$CLI_BIN" "$@"
+}
+
+cmd_list() {
+  local names n
+  names=$(instance_names)
+  [[ -n $names ]] || { echo "no instances yet (run: bash install.sh)"; return 0; }
+  printf '%-10s %-26s %-6s %-6s %-10s %-10s %s\n' NAME HOST GW BUYER MEM STATE TUNNEL
+  while read -r n; do
+    [[ -n $n ]] || continue
+    (
+      . "$(state_file "$n")"
+      pid=$(systemctl show -p MainPID --value "$INSTANCE-buyer" 2>/dev/null || echo 0)
+      mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{ printf "%d MiB", $1 / 1024 }' || true)
+      [[ -n $mem ]] || mem="-"
+      st=$(systemctl is-active "$INSTANCE-gateway" 2>/dev/null || echo unknown)
+      printf '%-10s %-26s %-6s %-6s %-10s %-10s %s\n' \
+        "$n" "$HOST" "$GW_PORT" "$BUYER_PORT" "$mem" "$st" "${TUNNEL_ID:0:8}"
+    )
+  done <<<"$names"
+}
+
+cmd_status() {
+  local names n code
+  if [[ -n ${1:-} ]]; then names=$1; else names=$(instance_names); fi
+  [[ -n $names ]] || { echo "no instances"; return 0; }
+  while read -r n; do
+    [[ -n $n ]] || continue
+    load_instance "$n"
+    echo "${C_BOLD}$n${C_0}  https://$HOST/v1"
+    printf '  %-18s %s\n' gateway "$(systemctl is-active "$n-gateway" 2>/dev/null || true)"
+    printf '  %-18s %s\n' buyer "$(systemctl is-active "$n-buyer" 2>/dev/null || true)"
+    code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "https://$HOST/v1/models" \
+      -H "Authorization: Bearer $API_KEY" 2>/dev/null || echo 000)
+    printf '  %-18s %s\n' "public /v1/models" "$code"
+    if [[ $code != 200 ]]; then
+      code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$GW_PORT/v1/models" \
+        -H "Authorization: Bearer $API_KEY" 2>/dev/null || echo 000)
+      printf '  %-18s %s\n' "local /v1/models" "$code"
+    fi
+    echo
+  done <<<"$names"
+}
+
+cmd_keys() {
+  local name="" label="admin" a
+  for a in "$@"; do
+    case $a in
+      --label) label="";;
+      *) if [[ -z $name ]]; then name=$a; elif [[ -z $label ]]; then label=$a; fi;;
+    esac
+  done
+  load_instance "$name"
+  as_instance "$USER" "$HOME_DIR" gateway key create --label "${label:-admin}" --json |
+    node -e 'let s=""; process.stdin.on("data", d => s += d).on("end", () => {
+      const j = JSON.parse(s);
+      console.log("API key:", j.apiKey);
+      console.log("id:", j.id, "label:", j.label, "wallet:", j.identityAddress || "-");
+    });'
+}
+
+cmd_link()   { load_instance "${1:-}"; as_instance "$USER" "$HOME_DIR" gateway console-link; }
+cmd_recover(){ load_instance "${1:-}"; as_instance "$USER" "$HOME_DIR" gateway console-link --recover; }
+
+cmd_logs() {
+  local name=${1:-} follow=""
+  [[ -n $name ]] || die "usage: antseed-fleet logs NAME [-f]"
+  [[ ${2:-} == -f ]] && follow=-f
+  load_instance "$name"
+  if [[ -n $follow ]]; then
+    journalctl -u "$name-gateway" -u "$name-buyer" -f
+  else
+    journalctl -u "$name-gateway" -u "$name-buyer" -n 50 --no-pager
+  fi
+}
+
+each_instance() {
+  local action=$1 name=${2:-} names n
+  if [[ -n $name ]]; then names=$name; else names=$(instance_names); fi
+  [[ -n $names ]] || { echo "no instances"; return 0; }
+  while read -r n; do
+    [[ -n $n ]] || continue
+    "$action" "$n"
+  done <<<"$names"
+}
+
+restart_one() { systemctl restart "$1-buyer" "$1-gateway" && ok "$1 restarted"; }
+start_one()   { systemctl start "$1-buyer" "$1-gateway" && ok "$1 started"; }
+stop_one()    { systemctl stop "$1-gateway" "$1-buyer" && ok "$1 stopped"; }
+
+cmd_remove() {
+  local name="" purge=0 a host tunnel wallet home
+  for a in "$@"; do
+    case $a in
+      --keys) purge=1;;
+      -*) die "unknown option $a";;
+      *) name=$a;;
+    esac
+  done
+  load_instance "$name"
+  host=$HOST; tunnel=$TUNNEL_ID; wallet=$WALLET; home=$HOME_DIR
+  systemctl disable --now "$name-gateway" "$name-buyer" 2>/dev/null || true
+  rm -f "$UNIT_DIR/$name-gateway.service" "$UNIT_DIR/$name-buyer.service" "/etc/$name/gateway.env"
+  rmdir "/etc/$name" 2>/dev/null || true
+  systemctl daemon-reload
+  ok "services removed for $name"
+  if (( purge )); then
+    rm -rf "$home"
+    userdel "$name" 2>/dev/null || true
+    ok "data and user deleted (funds in $wallet are lost)"
+  else
+    warn "data kept at $home (wallet $wallet)"
+    warn "delete it later with: antseed-fleet remove $name --keys"
+  fi
+  rm -f "$(state_file "$name")"
+  warn "tunnel $tunnel and DNS $host remain in Cloudflare — delete them in the dashboard if unused"
+}
+
+cmd_doctor() {
+  local n
+  echo "${C_BOLD}CLI${C_0}"
+  if [[ -x $CLI_BIN ]]; then ok "$CLI_BIN"; else warn "missing $CLI_BIN"; fi
+  echo "${C_BOLD}systemd${C_0}"
+  systemctl is-system-running 2>/dev/null || true
+  echo "${C_BOLD}instances${C_0}"
+  while read -r n; do
+    [[ -n $n ]] || continue
+    load_instance "$n"
+    printf '  %-10s user=%-10s home=%-22s env=%s\n' "$n" "$USER" "$HOME_DIR" \
+      "$([[ -f /etc/$n/gateway.env ]] && echo ok || echo MISSING)"
+    systemctl is-active "$n-buyer" >/dev/null 2>&1 || warn "    $n-buyer not active"
+    systemctl is-active "$n-gateway" >/dev/null 2>&1 || warn "    $n-gateway not active"
+    [[ -d $HOME_DIR ]] || warn "    data dir missing"
+  done <<<"$(instance_names)"
+  echo "${C_BOLD}memory${C_0}"
+  free -m | sed 's/^/  /'
+}
+
+install_script() {
+  local d
+  for d in /opt/antseed-fleet "$(dirname "$(readlink -f "$0")")"; do
+    [[ -f $d/install.sh ]] && { printf '%s' "$d/install.sh"; return 0; }
+  done
+  return 1
+}
+
+cmd_help() {
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  echo
+  echo "create more instances:"
+  if f=$(install_script); then echo "  sudo bash $f"; else echo "  sudo bash install.sh"; fi
+}
+
+cmd_create() {
+  local f
+  f=$(install_script) || die "install.sh not found (expected /opt/antseed-fleet/install.sh)"
+  exec bash "$f" "$@"
+}
+
+case ${1:-help} in
+  list|ls)   cmd_list ;;
+  status)    shift; cmd_status "$@" ;;
+  keys)      shift; cmd_keys "$@" ;;
+  link)      shift; cmd_link "$@" ;;
+  recover)   shift; cmd_recover "$@" ;;
+  logs)      shift; cmd_logs "$@" ;;
+  restart)   shift; each_instance restart_one "$@" ;;
+  start)     shift; each_instance start_one "$@" ;;
+  stop)      shift; each_instance stop_one "$@" ;;
+  create)    shift; cmd_create "$@" ;;
+  remove|rm) shift; cmd_remove "$@" ;;
+  doctor)    cmd_doctor ;;
+  version|-v|--version) echo "antseed-fleet $VERSION" ;;
+  help|-h|--help|"") cmd_help ;;
+  *) die "unknown command '$1' (see: antseed-fleet help)" ;;
+esac
