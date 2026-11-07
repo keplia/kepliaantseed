@@ -125,10 +125,24 @@ antseed-fleet recover antseed1  # link recovery kalau console sudah diklaim
 antseed-fleet keys antseed1 --label laptop
 antseed-fleet logs antseed1 -f
 antseed-fleet restart|start|stop [NAME]
+antseed-fleet restore antseed1  # pulihkan ingress tunnel + DNS jika host 404
 antseed-fleet remove antseed1   # hapus service, data disimpan
 antseed-fleet remove antseed1 --keys
 antseed-fleet doctor
 ```
+
+## Troubleshooting: host mengembalikan 404 / hilang
+
+Instance hidup, `/console` jalan, tapi `/v1/...` membalas **404** tanpa header
+gateway? Artinya tunnel masih meneruskan ke gateway lain, karena konfigurasi
+ingress tunnel tertimpa oleh pembuatan instance lain.
+
+```bash
+sudo CF_API_TOKEN=cf_xxx antseed-fleet restore antseed1
+```
+
+Perintah ini menulis ulang ingress tunnel dan CNAME DNS ke host yang tercatat
+di `/etc/antseed-fleet/<nama>.env`.
 
 ## Catatan
 
