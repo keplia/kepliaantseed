@@ -557,20 +557,27 @@ create_one() { # create_one <instance> <host> <zone-id> <domain>
     } >"$(state_file "$inst")"
   )
 
-  local i up=0 code
-  for (( i = 0; i < 45; i++ )); do
-    if journalctl -u "$inst-gateway" --no-pager -n 200 2>/dev/null |
-      grep -qE 'Public HTTPS tunnel is running|Registered tunnel connection'; then
-      up=1; break
-    fi
+  # verify through the tunnel: the answer must carry this gateway's tag, so a
+  # stale or shared tunnel config (wrong gateway answering) is caught here
+  local i up=0 code tag body tagline="x-antseed-gateway-tag: "
+  for (( i = 0; i < 30; i++ )); do
+    body=$(curl -sS -m 20 -D - -o /dev/null "https://$host/v1/models" \
+      -H "Authorization: Bearer $key" 2>/dev/null || true)
+    code=$(head -1 <<<"$body" | awk '{ print $2 }')
+    tag=$(grep -i "^$tagline" <<<"$body" | tr -d '\r' | awk -F': ' '{ print $2 }')
+    [[ -n $tag ]] && { up=1; break; }
     sleep 2
   done
-  (( up )) || warn "tunnel still connecting"
 
-  code=$(curl -sS -m 45 -o /dev/null -w '%{http_code}' "https://$host/v1/models" \
-    -H "Authorization: Bearer $key" 2>/dev/null || true)
-  [[ $code == 200 ]] && ok "https://$host/v1/models -> 200" ||
-    warn "https://$host/v1/models -> ${code:-no response} (DNS may still propagate)"
+  if [[ $code == 200 && -n $tag ]]; then
+    ok "https://$host/v1/models -> 200"
+  elif [[ $code == 200 ]]; then
+    warn "https://$host/v1/models -> 200 but no gateway tag (answered by a proxy?)"
+  else
+    warn "https://$host/v1/models -> ${code:-no response}"
+    warn "the tunnel config did not take effect — check: antseed-fleet status $inst"
+  fi
+  (( up )) || warn "tunnel still connecting"
 
   local link
   link=$(as_instance "$user" "$home" gateway console-link 2>/dev/null | grep -oE 'https://[^ ]+' | head -1 || true)
